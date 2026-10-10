@@ -40,13 +40,30 @@ FEATURE_SETS = {
 
 
 # ---------------------------------------------------------------- 1. อ่านข้อมูล
+_AOI_CACHE = {}
+
+
+def aoi_mask(data_dir, grid):
+    """หน้ากากพื้นที่ศึกษา (True = อยู่ในขอบเขตอำเภอ) บนกริดที่กำหนด
+    จำเป็นเพราะ GeoTIFF ที่ส่งออกจาก GEE เก็บจุดภาพนอกพื้นที่ศึกษาเป็นค่า 0 ไม่ใช่ค่า nodata"""
+    key = (os.path.abspath(data_dir), tuple(grid['transform'])[:6], grid['height'], grid['width'])
+    if key not in _AOI_CACHE:
+        gdf = gpd.read_file(os.path.join(data_dir, 'boundary_amphoe.geojson')).to_crs(grid['crs'])
+        _AOI_CACHE[key] = rasterize([(g, 1) for g in gdf.geometry],
+                                    out_shape=(grid['height'], grid['width']),
+                                    transform=grid['transform'], fill=0, dtype='uint8') == 1
+    return _AOI_CACHE[key]
+
+
 def load_s1(data_dir, tag, pol):
     """อ่านภาพ Sentinel-1 หนึ่งแบนด์ คืนค่า (อาร์เรย์ dB แบบ float32, grid)
     ไฟล์เก็บค่า dB x 100 แบบ int16 จึงหารด้วย 100 กลับเป็น dB จุดภาพนอกพื้นที่ศึกษาเป็น NaN"""
     with rasterio.open(os.path.join(data_dir, f'S1_{tag}_{pol}.tif')) as src:
         arr = src.read(1, masked=True)
         grid = {'transform': src.transform, 'crs': src.crs, 'height': src.height, 'width': src.width}
-    return (arr.astype('float32') / 100.0).filled(np.nan), grid
+    arr = (arr.astype('float32') / 100.0).filled(np.nan)
+    arr[~aoi_mask(data_dir, grid)] = np.nan
+    return arr, grid
 
 
 def read_on_grid(path, grid, resampling='nearest', scale=1.0):
@@ -58,6 +75,7 @@ def read_on_grid(path, grid, resampling='nearest', scale=1.0):
                   src_nodata=src.nodata, dst_nodata=np.nan,
                   dst_transform=grid['transform'], dst_crs=grid['crs'],
                   resampling=getattr(Resampling, resampling))
+    dst[~aoi_mask(os.path.dirname(path), grid)] = np.nan
     return dst * scale
 
 
@@ -217,10 +235,12 @@ def predict_raster(model, feats, names, valid, chunk=2_000_000):
 
 # ---------------------------------------------------------------- 4. แผนที่มาตรฐานวารสาร
 def journal_map(ax, grid, amphoe, province=None, lonlat_step=0.1, scalebar_km=10,
-                north=True, label_amphoe=True, edge='black'):
+                north=True, label_amphoe=True, edge='black', pad_left=0.0):
     """เติมองค์ประกอบแผนที่ลงบนแกน ax ที่พล็อตราสเตอร์ไว้แล้ว:
-    ขอบเขตจังหวัด/อำเภอ, กริดพิกัดภูมิศาสตร์, มาตราส่วน, ทิศเหนือ, ชื่ออำเภอ"""
+    ขอบเขตจังหวัด/อำเภอ, กริดพิกัดภูมิศาสตร์, มาตราส่วน, ทิศเหนือ, ชื่ออำเภอ
+    pad_left: ขยายกรอบแผนที่ไปทางซ้าย (สัดส่วนของความกว้าง) เพื่อเว้นที่ให้แผนที่แทรกและคำอธิบายสัญลักษณ์"""
     left, right, bottom, top = extent(grid)
+    left -= pad_left * (right - left)
     if province is not None:
         province.boundary.plot(ax=ax, color='dimgray', linewidth=1.6, linestyle='--', zorder=5)
     amphoe.boundary.plot(ax=ax, color=edge, linewidth=1.0, zorder=6)
